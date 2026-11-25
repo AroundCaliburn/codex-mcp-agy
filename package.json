@@ -1,0 +1,25 @@
+{
+  "name": "codex-mcp-agy",
+  "version": "0.1.0",
+  "description": "Thin MCP Server wrapping @openai/codex-sdk for Antigravity (agy) orchestration",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/index.js",
+    "test": "node --test dist/test/unit.test.js",
+    "smoke": "node dist/test/mcp-smoke.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@openai/codex-sdk": "^0.172.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
