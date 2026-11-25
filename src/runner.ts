@@ -4,17 +4,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  Codex,
-  type CodexOptions,
-  type ThreadEvent,
-  type ThreadItem,
-  type ThreadOptions,
-  type Usage,
-} from "@openai/codex-sdk";
+import type { Usage } from "@openai/codex-sdk";
+import { AppServerClient, RpcTimeoutError } from "./app-server.js";
 import { inspectGitWorkspace } from "./git.js";
 import { JobStore } from "./store.js";
-import type { ItemsSummary, JobKind, JobRecord, RunOptions } from "./types.js";
+import type { ItemsSummary, JobRecord, JobStatus, PendingRequest, RunOptions } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_PROGRESS_LINES = 15;
@@ -45,368 +39,455 @@ function appendProgress(current: string[], line: string): string[] {
   return next;
 }
 
-function summarizeCompletedItem(item: ThreadItem, summary: ItemsSummary): string | undefined {
+type Item =
+  | { type: "agentMessage"; text: string }
+  | { type: "commandExecution"; command: string; exitCode?: number | null; status: string }
+  | { type: "fileChange"; changes: Array<{ path: string; kind: { type: string } | string }>; status: string }
+  | { type: "mcpToolCall"; server: string; tool: string; status: string }
+  | { type: "webSearch"; query: string }
+  | { type: "error"; message: string };
+
+interface Turn {
+  id: string;
+  status: "completed" | "interrupted" | "failed" | "inProgress";
+  error?: { message: string } | null;
+  items?: Item[];
+}
+
+interface TokenCounts {
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens?: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+}
+
+interface TurnEvent {
+  threadId: string;
+  turnId?: string;
+  turn?: Turn;
+  item?: Item;
+  tokenUsage?: { total: TokenCounts };
+  requestId?: PendingRequest["requestId"];
+  error?: { message: string };
+  willRetry?: boolean;
+}
+
+interface ActiveJob {
+  jobId: string;
+  threadId?: string;
+  turnId?: string;
+  startingTurn: boolean;
+  cancelling?: boolean;
+  startup?: Promise<void>;
+  finishing?: Promise<void>;
+  pending: PendingRequest[];
+  waiter?: { resolve: (job: JobRecord) => void; reject: (error: unknown) => void };
+  items: ItemsSummary;
+  finalResponse?: string;
+  usage?: Usage;
+  error?: string;
+  failure?: string;
+}
+
+const REQUEST_KINDS = new Map<string, PendingRequest["kind"]>([
+  ["item/commandExecution/requestApproval", "command_approval"],
+  ["item/fileChange/requestApproval", "file_approval"],
+  ["item/tool/requestUserInput", "user_input"],
+]);
+
+type Decision = "accept" | "acceptForSession" | "decline" | "cancel";
+
+function textInput(text: string) {
+  return [{ type: "text", text, text_elements: [] }];
+}
+
+function summarizeCompletedItem(item: Item, summary: ItemsSummary): string | undefined {
   switch (item.type) {
-    case "agent_message":
+    case "agentMessage":
       return `agent: ${truncateText(item.text, 120)}`;
-    case "command_execution":
-      summary.commands.push({
-        command: item.command,
-        exitCode: item.exit_code,
+    case "commandExecution": {
+      const exitCode = item.exitCode ?? undefined;
+      summary.commands.push({ command: item.command, exitCode, status: item.status });
+      return `cmd (${item.status}${exitCode !== undefined ? `:${exitCode}` : ""}): ${truncateText(item.command, 100)}`;
+    }
+    case "fileChange": {
+      const changes = item.changes.map(({ path, kind }) => ({
+        path,
+        kind: typeof kind === "string" ? kind : kind.type,
         status: item.status,
-      });
-      return `cmd (${item.status}${item.exit_code !== undefined ? `:${item.exit_code}` : ""}): ${truncateText(item.command, 100)}`;
-    case "file_change":
-      for (const ch of item.changes) {
-        summary.fileChanges.push({ path: ch.path, kind: ch.kind, status: item.status });
-      }
-      return `files (${item.status}): ${item.changes.map((c) => `${c.kind}:${c.path}`).join(", ")}`;
-    case "mcp_tool_call":
-      summary.mcpToolCalls.push({
-        server: item.server,
-        tool: item.tool,
-        status: item.status,
-      });
+      }));
+      summary.fileChanges.push(...changes);
+      return `files (${item.status}): ${changes.map((c) => `${c.kind}:${c.path}`).join(", ")}`;
+    }
+    case "mcpToolCall":
+      summary.mcpToolCalls.push({ server: item.server, tool: item.tool, status: item.status });
       return `mcp (${item.status}): ${item.server}.${item.tool}`;
-    case "web_search":
+    case "webSearch":
       summary.webSearches.push(item.query);
       return `search: ${truncateText(item.query, 80)}`;
     case "error":
       return `error: ${truncateText(item.message, 120)}`;
-    case "todo_list":
-    case "reasoning":
-      return undefined;
   }
 }
 
 export class CodexRunner {
-  private readonly store: JobStore;
-  private readonly activeControllers = new Map<string, AbortController>();
+  private readonly active = new Map<string, ActiveJob>();
+  private readonly client: AppServerClient;
+  private closing = false;
 
-  constructor(store: JobStore) {
-    this.store = store;
+  constructor(
+    private readonly store: JobStore,
+    { binary, requestTimeoutMs }: { binary?: string; requestTimeoutMs?: number } = {},
+  ) {
+    this.client = new AppServerClient({
+      notification: (method, params) => this.onNotification(method, params as TurnEvent),
+      request: (id, method, params) => this.onRequest(id, method, params),
+      disconnect: (error) => {
+        for (const job of this.active.values()) {
+          this.finish(job, job.failure ? "failed" : "interrupted", job.failure ?? error.message);
+        }
+      },
+    }, binary, requestTimeoutMs);
   }
 
   getStore(): JobStore {
     return this.store;
   }
 
-  private createCodexClient(): Codex {
-    const options: CodexOptions = {};
-    const override = process.env.CODEX_PATH_OVERRIDE?.trim();
-    if (override) {
-      options.codexPathOverride = override;
-    }
-    return new Codex(options);
-  }
-
   async startJob(options: RunOptions): Promise<JobRecord> {
+    if (this.closing) throw new Error("Codex runner is shutting down");
     const workingDirectory = path.resolve(options.workingDirectory);
-    if (!fs.existsSync(workingDirectory)) {
-      throw new Error(`Working directory does not exist: ${workingDirectory}`);
+    if (!fs.statSync(workingDirectory, { throwIfNoEntry: false })?.isDirectory()) {
+      throw new Error(`Working directory does not exist or is not a directory: ${workingDirectory}`);
     }
 
-    const kind: JobKind = options.kind ?? "run";
-    const sandboxMode = options.sandboxMode ?? "workspace-write";
-    const approvalPolicy = options.approvalPolicy ?? "never";
-    const resolvedModel = resolveModelAlias(options.model);
+    const threadId = options.threadId?.trim() ||
+      (options.resumeLatest ? this.store.getLatestThreadId(workingDirectory) : undefined);
+    if (threadId && this.activeThread(threadId)) {
+      throw new Error(`Thread ${threadId} already has an active job. Use codex_steer or codex_respond.`);
+    }
     const now = new Date().toISOString();
     const jobId = `codex-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
-
-    let resumeThreadId = options.threadId?.trim() || undefined;
-    if (!resumeThreadId && options.resumeLatest) {
-      resumeThreadId = this.store.getLatestThreadId(workingDirectory);
-    }
-
-    const initialJob: JobRecord = {
+    const initial = this.store.createJob({
       jobId,
-      kind,
+      kind: options.kind ?? "run",
       status: "running",
       workingDirectory,
       promptPreview: truncateText(options.prompt, PROMPT_PREVIEW_LIMIT),
-      model: resolvedModel,
+      model: resolveModelAlias(options.model),
       effort: options.effort,
-      sandboxMode,
-      approvalPolicy,
+      sandboxMode: options.sandboxMode ?? "workspace-write",
+      approvalPolicy: options.approvalPolicy ?? "never",
       allowedPaths: options.allowedPaths,
-      threadId: resumeThreadId,
+      threadId,
       createdAt: now,
       startedAt: now,
-      progress: [
-        resumeThreadId
-          ? `Resuming thread ${resumeThreadId} in ${sandboxMode} mode`
-          : `Starting new thread in ${sandboxMode} mode`,
-      ],
+      progress: [threadId
+        ? `Resuming thread ${threadId} in ${options.sandboxMode ?? "workspace-write"} mode`
+        : `Starting new thread in ${options.sandboxMode ?? "workspace-write"} mode`],
+    });
+    const active: ActiveJob = {
+      jobId, threadId, startingTurn: false, pending: [],
+      items: { commands: [], fileChanges: [], mcpToolCalls: [], webSearches: [] },
     };
-
-    this.store.createJob(initialJob);
-
-    const controller = new AbortController();
-    this.activeControllers.set(jobId, controller);
-
-    const runPromise = this.executeInternal(jobId, {
-      ...options,
-      workingDirectory,
-      sandboxMode,
-      approvalPolicy,
-      model: resolvedModel,
-      threadId: resumeThreadId,
-    }, controller);
-
-    if (options.background) {
-      runPromise.catch((err) => {
-        console.error(`[codex-mcp-agy] Background job ${jobId} failed unexpectedly:`, err);
-      });
-      return this.store.getJob(jobId) ?? initialJob;
-    }
-
-    return await runPromise;
+    this.active.set(jobId, active);
+    const result = options.background ? initial : this.waitForJob(active);
+    active.startup = this.startTurn(active, initial, options);
+    return result;
   }
 
-  private async executeInternal(
-    jobId: string,
-    options: RunOptions & {
-      sandboxMode: NonNullable<RunOptions["sandboxMode"]>;
-      approvalPolicy: NonNullable<RunOptions["approvalPolicy"]>;
-    },
-    controller: AbortController,
-  ): Promise<JobRecord> {
-    const startMs = Date.now();
-    const itemsSummary: ItemsSummary = {
-      commands: [],
-      fileChanges: [],
-      mcpToolCalls: [],
-      webSearches: [],
-    };
-    let finalResponse = "";
-    let usage: Usage | null = null;
-    let streamError: string | undefined;
-
+  private async startTurn(active: ActiveJob, job: JobRecord, options: RunOptions): Promise<void> {
     try {
-      const codex = this.createCodexClient();
-      const threadOptions: ThreadOptions = {
-        workingDirectory: options.workingDirectory,
-        sandboxMode: options.sandboxMode,
-        approvalPolicy: options.approvalPolicy,
-        skipGitRepoCheck: options.skipGitRepoCheck ?? false,
-        ...(options.model ? { model: options.model } : {}),
-        ...(options.effort ? { modelReasoningEffort: options.effort } : {}),
-        ...(options.additionalDirectories?.length
-          ? { additionalDirectories: options.additionalDirectories.map((d) => path.resolve(d)) }
-          : {}),
+      if (!options.skipGitRepoCheck) {
+        const { stdout } = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {
+          cwd: job.workingDirectory,
+          timeout: 5000,
+        }).catch(() => ({ stdout: "" }));
+        if (stdout.trim() !== "true") {
+          throw new Error("Working directory is outside a Git repository. Set skipGitRepoCheck to run here.");
+        }
+        if (!this.active.has(job.jobId)) return;
+      }
+
+      const threadParams = {
+        model: job.model,
+        cwd: job.workingDirectory,
+        approvalPolicy: job.approvalPolicy,
+        sandbox: job.sandboxMode,
+        config: job.sandboxMode === "workspace-write" && options.additionalDirectories?.length
+          ? { "sandbox_workspace_write.writable_roots": options.additionalDirectories.map((dir) => path.resolve(dir)) }
+          : undefined,
       };
+      const { thread } = await this.client.request<{ thread: { id: string } }>(
+        job.threadId ? "thread/resume" : "thread/start",
+        job.threadId ? { ...threadParams, threadId: job.threadId } : threadParams,
+      );
+      if (!this.active.has(job.jobId)) return;
+      active.threadId = thread.id;
+      this.store.updateJob(job.jobId, (cur) => ({
+        ...cur,
+        threadId: thread.id,
+        progress: appendProgress(cur.progress, `thread.started: ${thread.id}`),
+      }));
 
-      const thread = options.threadId
-        ? codex.resumeThread(options.threadId, threadOptions)
-        : codex.startThread(threadOptions);
-
-      const { events } = await thread.runStreamed(options.prompt, {
-        signal: controller.signal,
+      active.startingTurn = true;
+      const { turn } = await this.client.request<{ turn: Turn }>("turn/start", {
+        threadId: thread.id,
+        input: textInput(options.prompt),
+        cwd: job.workingDirectory,
+        approvalPolicy: job.approvalPolicy,
+        effort: job.effort,
       });
-
-      for await (const event of events as AsyncGenerator<ThreadEvent>) {
-        if (controller.signal.aborted) {
-          break;
-        }
-
-        switch (event.type) {
-          case "thread.started":
-            this.store.updateJob(jobId, (cur) => ({
-              ...cur,
-              threadId: event.thread_id,
-              progress: appendProgress(cur.progress, `thread.started: ${event.thread_id}`),
-            }));
-            break;
-
-          case "item.completed": {
-            if (event.item.type === "agent_message") {
-              finalResponse = event.item.text;
-            }
-            const line = summarizeCompletedItem(event.item, itemsSummary);
-            if (line) {
-              this.store.updateJob(jobId, (cur) => ({
-                ...cur,
-                progress: appendProgress(cur.progress, line),
-              }));
-            }
-            break;
-          }
-
-          case "turn.completed":
-            usage = event.usage;
-            break;
-
-          case "turn.failed":
-            streamError = event.error.message;
-            break;
-
-          case "error":
-            streamError = event.message;
-            break;
-
-          case "turn.started":
-          case "item.started":
-          case "item.updated":
-            break;
-        }
-      }
-
-      const finishedAt = new Date().toISOString();
-      const durationMs = Date.now() - startMs;
-
-      if (controller.signal.aborted) {
-        return (
-          this.store.updateJob(jobId, (cur) => ({
-            ...cur,
-            status: "cancelled",
-            finishedAt,
-            durationMs,
-            finalResponse: finalResponse || cur.finalResponse,
-            itemsSummary,
-            usage,
-            progress: appendProgress(cur.progress, "Job cancelled"),
-          })) ?? this.store.getJob(jobId)!
-        );
-      }
-
-      if (streamError) {
-        return (
-          this.store.updateJob(jobId, (cur) => ({
-            ...cur,
-            status: "failed",
-            finishedAt,
-            durationMs,
-            finalResponse: finalResponse || undefined,
-            itemsSummary,
-            usage,
-            error: streamError,
-            progress: appendProgress(cur.progress, `Failed: ${truncateText(streamError!, 120)}`),
-          })) ?? this.store.getJob(jobId)!
-        );
-      }
-
-      const gitSummary =
-        (options.kind ?? "run") === "run"
-          ? await inspectGitWorkspace(options.workingDirectory, options.allowedPaths)
-          : undefined;
-
-      return (
-        this.store.updateJob(jobId, (cur) => ({
-          ...cur,
-          status: "completed",
-          threadId: cur.threadId ?? thread.id ?? undefined,
-          finishedAt,
-          durationMs,
-          finalResponse,
-          itemsSummary,
-          usage,
-          gitSummary,
-          progress: appendProgress(cur.progress, `Completed in ${durationMs}ms`),
-        })) ?? this.store.getJob(jobId)!
-      );
+      if (!this.active.has(job.jobId)) return;
+      this.setTurnId(active, turn.id);
     } catch (err) {
-      const finishedAt = new Date().toISOString();
-      const durationMs = Date.now() - startMs;
       const message = err instanceof Error ? err.message : String(err);
-
-      if (controller.signal.aborted) {
-        return (
-          this.store.updateJob(jobId, (cur) => ({
-            ...cur,
-            status: "cancelled",
-            finishedAt,
-            durationMs,
-            finalResponse: finalResponse || cur.finalResponse,
-            itemsSummary,
-            usage,
-            progress: appendProgress(cur.progress, "Job cancelled"),
-          })) ?? this.store.getJob(jobId)!
-        );
+      if (err instanceof RpcTimeoutError && err.method === "turn/start" && this.active.has(active.jobId)) {
+        active.failure = message;
+        await this.client.reset();
       }
-
-      return (
-        this.store.updateJob(jobId, (cur) => ({
-          ...cur,
-          status: "failed",
-          finishedAt,
-          durationMs,
-          finalResponse: finalResponse || undefined,
-          itemsSummary,
-          usage,
-          error: message,
-          progress: appendProgress(cur.progress, `Error: ${truncateText(message, 120)}`),
-        })) ?? this.store.getJob(jobId)!
-      );
-    } finally {
-      this.activeControllers.delete(jobId);
+      this.finish(active, "failed", message);
     }
   }
 
-  cancelJob(options: { jobId?: string; workingDirectory?: string }): {
+  private activeThread(threadId: string): ActiveJob | undefined {
+    return [...this.active.values()].find((job) => job.threadId === threadId);
+  }
+
+  private waitForJob(active: ActiveJob): Promise<JobRecord> {
+    return new Promise((resolve, reject) => { active.waiter = { resolve, reject }; });
+  }
+
+  private publish(active: ActiveJob, job: JobRecord): void {
+    active.waiter?.resolve(job);
+    active.waiter = undefined;
+  }
+
+  private setTurnId(active: ActiveJob, turnId: string): void {
+    if (active.turnId) return;
+    active.turnId = turnId;
+    this.store.updateJob(active.jobId, (cur) => ({ ...cur, turnId }));
+  }
+
+  private updatePending(active: ActiveJob): JobRecord | undefined {
+    const pendingRequest = active.pending[0];
+    try {
+      const job = this.store.updateJob(active.jobId, (cur) => ({
+        ...cur,
+        turnId: active.turnId,
+        pendingRequest,
+        status: !pendingRequest ? "running" : pendingRequest.kind === "user_input" ? "waiting_input" : "waiting_approval",
+      }))!;
+      if (pendingRequest) this.publish(active, job);
+      return job;
+    } catch (err) {
+      const message = `Failed to save pending request state: ${err instanceof Error ? err.message : String(err)}`;
+      active.failure = message;
+      try {
+        for (const request of active.pending) {
+          if (request.kind === "user_input") this.client.reject(request.requestId, message, -32603);
+          else this.client.respond(request.requestId, { decision: "cancel" });
+        }
+      } catch {
+        void this.client.reset().then(() => this.finish(active, "failed", message));
+        return;
+      }
+      this.finish(active, "failed", message);
+    }
+  }
+
+  private onRequest(id: PendingRequest["requestId"], method: string, details: unknown): void {
+    const request = details as {
+      threadId: string;
+      turnId: string;
+      command?: string;
+      reason?: string;
+      questions?: Array<{ question: string }>;
+    };
+    const kind = REQUEST_KINDS.get(method);
+    const active = this.activeThread(request?.threadId);
+    if (!kind || !active?.startingTurn || !request.turnId) {
+      this.client.reject(id, `Unsupported request or inactive turn: ${method}`);
+      return;
+    }
+    active.turnId ??= request.turnId;
+    if (active.turnId !== request.turnId) {
+      this.client.reject(id, `Unsupported request or inactive turn: ${method}`);
+      return;
+    }
+
+    const summary = request.questions?.map((q) => q.question).join(" ") ||
+      request.command || request.reason || (kind === "file_approval" ? "File change approval" : "Codex needs input");
+    active.pending.push({ requestId: id, method, kind, summary, details, createdAt: new Date().toISOString() });
+    if (active.pending.length === 1) this.updatePending(active);
+  }
+
+  private onNotification(method: string, event: TurnEvent): void {
+    if (!event?.threadId) return;
+    const active = this.activeThread(event.threadId);
+    if (!active) return;
+    if (method === "turn/started" && active.startingTurn && event.turn) this.setTurnId(active, event.turn.id);
+    if (method === "serverRequest/resolved") {
+      const pending = active.pending.filter((request) => request.requestId !== event.requestId);
+      if (pending.length !== active.pending.length) {
+        active.pending = pending;
+        this.updatePending(active);
+      }
+      return;
+    }
+    if (!active.turnId || active.turnId !== (event.turn?.id ?? event.turnId)) return;
+
+    if (method === "item/completed" && event.item) {
+      if (event.item.type === "agentMessage") active.finalResponse = event.item.text;
+      if (event.item.type === "error") active.error = event.item.message;
+      const line = summarizeCompletedItem(event.item, active.items);
+      if (line) this.store.updateJob(active.jobId, (cur) => ({ ...cur, progress: appendProgress(cur.progress, line) }));
+    } else if (method === "thread/tokenUsage/updated" && event.tokenUsage) {
+      const counts = event.tokenUsage.total;
+      active.usage = {
+        input_tokens: counts.inputTokens,
+        cached_input_tokens: counts.cachedInputTokens,
+        cache_write_input_tokens: counts.cacheWriteInputTokens ?? 0,
+        output_tokens: counts.outputTokens,
+        reasoning_output_tokens: counts.reasoningOutputTokens,
+      };
+    } else if (method === "error" && !event.willRetry) {
+      active.error = event.error?.message;
+    } else if (method === "turn/completed" && event.turn && event.turn.status !== "inProgress") {
+      const status = event.turn.status === "interrupted" && active.cancelling ? "cancelled" : event.turn.status;
+      const error = event.turn.error?.message ?? (status === "failed" ? active.error ?? "Codex turn failed" : undefined);
+      active.finalResponse ??= event.turn.items?.filter((item) => item.type === "agentMessage").at(-1)?.text;
+      this.finish(active, status, error);
+    }
+  }
+
+  private finish(active: ActiveJob, status: JobStatus, error?: string): void {
+    if (!this.active.delete(active.jobId)) return;
+    const job = this.store.getJob(active.jobId)!;
+    const finishedAt = new Date().toISOString();
+    const durationMs = Date.parse(finishedAt) - Date.parse(job.startedAt);
+    const finalize = (gitSummary?: JobRecord["gitSummary"]) => {
+      try {
+        const updated = this.store.updateJob(active.jobId, (cur) => ({
+          ...cur,
+          status, error, finishedAt, durationMs, gitSummary,
+          pendingRequest: undefined,
+          itemsSummary: active.items,
+          usage: active.usage ?? null,
+          finalResponse: active.finalResponse ?? (status === "completed" ? "" : undefined),
+          progress: appendProgress(cur.progress, error ? `Error: ${truncateText(error, 120)}` : `Job ${status} in ${durationMs}ms`),
+        }))!;
+        this.publish(active, updated);
+      } catch (err) {
+        if (active.waiter) active.waiter.reject(err);
+        else console.error(`[codex-mcp-agy] Failed to save job ${active.jobId}:`, err);
+        active.waiter = undefined;
+      }
+    };
+    if (status === "completed" && job.kind === "run") {
+      active.finishing = inspectGitWorkspace(job.workingDirectory, job.allowedPaths).then(finalize, () => finalize());
+    } else {
+      finalize();
+    }
+  }
+
+  async respondToJob(options: {
+    jobId: string;
+    requestId?: PendingRequest["requestId"];
+    decision?: Decision;
+    answers?: Record<string, string[]>;
+    wait?: boolean;
+  }): Promise<JobRecord> {
+    const active = this.active.get(options.jobId);
+    const pending = active?.pending[0];
+    if (!active || !pending || active.cancelling || active.failure) {
+      throw new Error(`Job ${options.jobId} has no pending request available to answer`);
+    }
+    if (options.requestId === undefined && active.pending.length > 1) {
+      throw new Error(`Job ${options.jobId} has multiple pending requests. Provide requestId ${JSON.stringify(pending.requestId)} for the current request.`);
+    }
+    if (options.requestId !== undefined && options.requestId !== pending.requestId) {
+      throw new Error(`requestId ${JSON.stringify(options.requestId)} does not match the current pending request ${JSON.stringify(pending.requestId)}`);
+    }
+
+    if (pending.kind === "user_input") {
+      if (!options.answers || options.decision !== undefined) throw new Error("This job requires answers");
+      const answers = Object.fromEntries(Object.entries(options.answers).map(([id, answers]) => [id, { answers }]));
+      this.client.respond(pending.requestId, { answers });
+    } else {
+      if (!options.decision || options.answers !== undefined) throw new Error("This job requires an approval decision");
+      this.client.respond(pending.requestId, { decision: options.decision });
+    }
+    active.pending.shift();
+    const updated = this.updatePending(active);
+    if (!updated) throw new Error(active.failure);
+    return options.wait && updated.status === "running" ? this.waitForJob(active) : updated;
+  }
+
+  async steerJob({ jobId, prompt }: { jobId: string; prompt: string }): Promise<JobRecord> {
+    const active = this.active.get(jobId);
+    const job = this.store.getJob(jobId);
+    if (!active?.threadId || !active.turnId || active.cancelling || job?.status !== "running") {
+      throw new Error(`Job ${jobId} does not have a running turn`);
+    }
+    await this.client.request("turn/steer", {
+      threadId: active.threadId,
+      expectedTurnId: active.turnId,
+      input: textInput(prompt),
+    });
+    return this.store.getJob(jobId) ?? job;
+  }
+
+  async cancelJob({ jobId, workingDirectory }: { jobId?: string; workingDirectory?: string }): Promise<{
     cancelled: boolean;
     job?: JobRecord;
     reason?: string;
-  } {
-    let target: JobRecord | undefined;
-    if (options.jobId) {
-      target = this.store.getJob(options.jobId);
-    } else {
-      target = this.store.getRunningJobs(options.workingDirectory)[0];
+  }> {
+    const job = jobId ? this.store.getJob(jobId) : this.store.getActiveJobs(workingDirectory)
+      .find((candidate) => this.active.has(candidate.jobId));
+    if (!job) return { cancelled: false, reason: jobId ? `Job not found: ${jobId}` : "No active job found" };
+
+    const active = this.active.get(job.jobId);
+    if (!active || active.cancelling) return { cancelled: false, job, reason: "Job is finishing or has no active turn in this process" };
+    active.cancelling = true;
+    try {
+      if (active.startingTurn && !active.turnId) await active.startup;
+      if (!this.active.has(job.jobId)) {
+        await active.finishing;
+        const current = this.store.getJob(job.jobId)!;
+        return { cancelled: current.status === "cancelled", job: current };
+      }
+      if (active.threadId && active.turnId) {
+        await this.client.request("turn/interrupt", { threadId: active.threadId, turnId: active.turnId });
+      }
+      this.finish(active, "cancelled");
+      await active.finishing;
+      const current = this.store.getJob(job.jobId)!;
+      return { cancelled: current.status === "cancelled", job: current };
+    } catch (err) {
+      active.cancelling = false;
+      throw err;
     }
-
-    if (!target) {
-      return {
-        cancelled: false,
-        reason: options.jobId
-          ? `Job not found: ${options.jobId}`
-          : "No active running job found",
-      };
-    }
-
-    const controller = this.activeControllers.get(target.jobId);
-    if (!controller) {
-      return {
-        cancelled: false,
-        job: target,
-        reason: `Job ${target.jobId} is not actively running in this server process (status: ${target.status})`,
-      };
-    }
-
-    controller.abort();
-    const updated = this.store.updateJob(target.jobId, (cur) => ({
-      ...cur,
-      status: "cancelled",
-      finishedAt: cur.finishedAt ?? new Date().toISOString(),
-      progress: appendProgress(cur.progress, "Cancellation requested"),
-    }));
-
-    return {
-      cancelled: true,
-      job: updated ?? target,
-    };
   }
 
-  abortAll(): void {
-    for (const [jobId, controller] of this.activeControllers.entries()) {
-      controller.abort();
-      this.store.updateJob(jobId, (cur) => ({
-        ...cur,
-        status: "cancelled",
-        finishedAt: cur.finishedAt ?? new Date().toISOString(),
-        progress: appendProgress(cur.progress, "Aborted due to server shutdown"),
-      }));
+  async shutdown(): Promise<void> {
+    this.closing = true;
+    try {
+      for (const job of this.active.values()) this.finish(job, "interrupted", "Codex runner shut down while job was active");
+    } finally {
+      await this.client.shutdown();
     }
-    this.activeControllers.clear();
   }
 
   async checkHealth(): Promise<Record<string, unknown>> {
-    const codexBin = process.env.CODEX_PATH_OVERRIDE?.trim() || "codex";
+    const { binary: codexBin, command, args } = this.client.executable;
     let cliAvailable = false;
     let cliVersion: string | null = null;
     let cliError: string | null = null;
 
     try {
-      const { stdout } = await execFileAsync(codexBin, ["--version"], { timeout: 5000 });
+      const { stdout } = await execFileAsync(command, [...args, "--version"], { timeout: 5000 });
       cliAvailable = true;
       cliVersion = stdout.trim();
     } catch (err) {
@@ -421,7 +502,7 @@ export class CodexRunner {
     );
 
     const jobs = this.store.listJobs();
-    const runningCount = jobs.filter((j) => j.status === "running").length;
+    const runningCount = this.active.size;
 
     return {
       ok: cliAvailable && (authJsonExists || hasApiKeyEnv),

@@ -4,7 +4,7 @@ import { z } from "zod";
 import { buildAdversarialReviewPrompt, buildReviewPrompt } from "./prompts.js";
 import { CodexRunner } from "./runner.js";
 import { JobStore } from "./store.js";
-import type { JobRecord } from "./types.js";
+import { formatJobSummary } from "./job-summary.js";
 
 const SandboxModeSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const ApprovalPolicySchema = z.enum(["never", "on-request", "on-failure", "untrusted"]);
@@ -43,29 +43,6 @@ function errorContent(err: unknown) {
   };
 }
 
-function formatJobSummary(job: JobRecord) {
-  return {
-    jobId: job.jobId,
-    kind: job.kind,
-    status: job.status,
-    workingDirectory: job.workingDirectory,
-    threadId: job.threadId ?? null,
-    resumeHint: job.threadId ? `codex resume ${job.threadId}` : null,
-    model: job.model ?? "default",
-    effort: job.effort ?? "default",
-    sandboxMode: job.sandboxMode,
-    createdAt: job.createdAt,
-    finishedAt: job.finishedAt ?? null,
-    durationMs: job.durationMs ?? null,
-    progress: job.progress,
-    finalResponse: job.finalResponse ?? null,
-    itemsSummary: job.itemsSummary ?? null,
-    usage: job.usage ?? null,
-    gitSummary: job.gitSummary ?? null,
-    error: job.error ?? null,
-  };
-}
-
 export function createServer(): { server: McpServer; runner: CodexRunner } {
   const store = new JobStore();
   store.load();
@@ -73,14 +50,14 @@ export function createServer(): { server: McpServer; runner: CodexRunner } {
 
   const server = new McpServer({
     name: "codex-mcp-agy",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   server.registerTool(
     "codex_run",
     {
       description:
-        "Delegate an implementation, debugging, refactoring, or investigation task to Codex via @openai/codex-sdk. Supports synchronous or background execution, thread resumption, and allowedPaths drift checking.",
+        "Delegate an implementation, debugging, refactoring, or investigation task to Codex via Codex app-server. Supports synchronous or background execution, thread resumption, and allowedPaths drift checking.",
       inputSchema: {
         prompt: z.string().min(1).describe("Clear, self-contained task specification for Codex."),
         workingDirectory: z
@@ -261,6 +238,8 @@ export function createServer(): { server: McpServer; runner: CodexRunner } {
             status: job.status,
             workingDirectory: job.workingDirectory,
             threadId: job.threadId ?? null,
+            turnId: job.turnId ?? null,
+            pendingRequest: job.pendingRequest ?? null,
             createdAt: job.createdAt,
             finishedAt: job.finishedAt ?? null,
             durationMs: job.durationMs ?? null,
@@ -282,6 +261,8 @@ export function createServer(): { server: McpServer; runner: CodexRunner } {
             status: j.status,
             workingDirectory: j.workingDirectory,
             threadId: j.threadId ?? null,
+            turnId: j.turnId ?? null,
+            pendingRequest: j.pendingRequest ?? null,
             promptPreview: j.promptPreview,
             createdAt: j.createdAt,
             finishedAt: j.finishedAt ?? null,
@@ -337,18 +318,18 @@ export function createServer(): { server: McpServer; runner: CodexRunner } {
   server.registerTool(
     "codex_cancel",
     {
-      description: "Cancel an active background Codex job by jobId or workingDirectory.",
+      description: "Cancel an active Codex job by jobId or workingDirectory.",
       inputSchema: {
         jobId: z.string().optional().describe("Job ID to cancel."),
         workingDirectory: z
           .string()
           .optional()
-          .describe("If jobId is omitted, cancels the newest running job in this directory."),
+          .describe("If jobId is omitted, cancels the newest active job in this directory."),
       },
     },
     async (args) => {
       try {
-        const res = runner.cancelJob({
+        const res = await runner.cancelJob({
           jobId: args.jobId,
           workingDirectory: args.workingDirectory,
         });
@@ -357,6 +338,42 @@ export function createServer(): { server: McpServer; runner: CodexRunner } {
           reason: res.reason ?? null,
           job: res.job ? formatJobSummary(res.job) : null,
         });
+      } catch (err) {
+        return errorContent(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "codex_respond",
+    {
+      description: "Answer a pending approval or user input request. With wait, return when the job finishes or pauses again.",
+      inputSchema: {
+        jobId: z.string().min(1),
+        requestId: z.union([z.string(), z.number()]).optional(),
+        decision: z.enum(["accept", "acceptForSession", "decline", "cancel"]).optional(),
+        answers: z.record(z.string(), z.array(z.string())).optional(),
+        wait: z.boolean().default(false),
+      },
+    },
+    async (args) => {
+      try {
+        return jsonContent(formatJobSummary(await runner.respondToJob(args)));
+      } catch (err) {
+        return errorContent(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "codex_steer",
+    {
+      description: "Send additional instructions to an active running Codex turn.",
+      inputSchema: { jobId: z.string().min(1), prompt: z.string().min(1) },
+    },
+    async (args) => {
+      try {
+        return jsonContent(formatJobSummary(await runner.steerJob(args)));
       } catch (err) {
         return errorContent(err);
       }
@@ -387,18 +404,24 @@ async function main() {
   const { server, runner } = createServer();
   const transport = new StdioServerTransport();
 
+  let closing = false;
   const shutdown = async () => {
-    runner.abortAll();
+    if (closing) return;
+    closing = true;
     try {
+      await runner.shutdown();
       await server.close();
-    } catch {
-      // ignore close errors during shutdown
+    } catch (err) {
+      console.error("[codex-mcp-agy] Shutdown failed:", err);
+      process.exitCode = 1;
+    } finally {
+      process.stdin.pause();
     }
-    process.exit(0);
   };
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  process.stdin.once("end", shutdown);
 
   await server.connect(transport);
 }

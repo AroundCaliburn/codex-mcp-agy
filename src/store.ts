@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { JobRecord } from "./types.js";
+import { isActiveJob, type JobRecord } from "./types.js";
 
 const MAX_JOBS = 50;
 
@@ -25,7 +25,7 @@ export class JobStore {
   private jobs: JobRecord[] = [];
   private loaded = false;
 
-  constructor(filePath: string = resolveStateFilePath()) {
+  constructor(filePath: string = resolveStateFilePath(), private readonly recover = true) {
     this.filePath = path.resolve(filePath);
   }
 
@@ -37,26 +37,21 @@ export class JobStore {
     if (this.loaded) return;
     this.loaded = true;
 
-    if (!fs.existsSync(this.filePath)) {
-      this.jobs = [];
-      return;
-    }
-
     try {
-      const raw = fs.readFileSync(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<StoreData>;
-      const list = Array.isArray(parsed.jobs) ? parsed.jobs : [];
+      this.jobs = this.read();
+      if (!this.recover) return;
       let recovered = false;
       const now = new Date().toISOString();
 
-      this.jobs = list.map((job) => {
-        if (job.status === "running") {
+      this.jobs = this.jobs.map((job) => {
+        if (isActiveJob(job.status)) {
           recovered = true;
           return {
             ...job,
             status: "interrupted" as const,
+            pendingRequest: undefined,
             finishedAt: job.finishedAt ?? now,
-            error: job.error ?? "MCP server restarted while job was running",
+            error: job.error ?? "MCP server restarted while job was active",
           };
         }
         return job;
@@ -71,6 +66,16 @@ export class JobStore {
     }
   }
 
+  private read(): JobRecord[] {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8")) as Partial<StoreData>;
+      return Array.isArray(parsed.jobs) ? parsed.jobs : [];
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
+    }
+  }
+
   private save(): void {
     const dir = path.dirname(this.filePath);
     fs.mkdirSync(dir, { recursive: true });
@@ -80,16 +85,15 @@ export class JobStore {
       jobs: this.jobs,
     };
     const tmpPath = `${this.filePath}.tmp.${process.pid}.${Date.now()}`;
-    fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), "utf8");
+    fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(tmpPath, this.filePath);
   }
 
   private prune(): void {
     if (this.jobs.length <= MAX_JOBS) return;
-    // Keep all running jobs plus the newest finished jobs up to MAX_JOBS.
-    const running = this.jobs.filter((j) => j.status === "running");
+    const running = this.jobs.filter((j) => isActiveJob(j.status));
     const nonRunning = this.jobs
-      .filter((j) => j.status !== "running")
+      .filter((j) => !isActiveJob(j.status))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
     const remainingSlots = Math.max(0, MAX_JOBS - running.length);
@@ -138,12 +142,12 @@ export class JobStore {
     return filtered;
   }
 
-  getRunningJobs(workingDirectory?: string): JobRecord[] {
-    return this.listJobs({ workingDirectory }).filter((j) => j.status === "running");
+  getActiveJobs(workingDirectory?: string): JobRecord[] {
+    return this.listJobs({ workingDirectory }).filter((j) => isActiveJob(j.status));
   }
 
   getLatestFinishedJob(workingDirectory?: string): JobRecord | undefined {
-    return this.listJobs({ workingDirectory }).find((j) => j.status !== "running");
+    return this.listJobs({ workingDirectory }).find((j) => !isActiveJob(j.status));
   }
 
   getLatestThreadId(workingDirectory: string): string | undefined {

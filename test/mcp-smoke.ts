@@ -28,7 +28,7 @@ async function main() {
 
   const client = new Client({
     name: "codex-mcp-smoke-client",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   try {
@@ -40,10 +40,12 @@ async function main() {
       "codex_adversarial_review",
       "codex_cancel",
       "codex_health",
+      "codex_respond",
       "codex_result",
       "codex_review",
       "codex_run",
       "codex_status",
+      "codex_steer",
     ]);
     console.log("listTools OK:", names.join(", "));
 
@@ -73,14 +75,16 @@ async function main() {
       jobId: runPayload.jobId,
       status: runPayload.status,
       threadId: runPayload.threadId,
+      turnId: runPayload.turnId,
       finalResponse: runPayload.finalResponse,
       error: runPayload.error,
     }));
 
     assert.equal(runPayload.status, "completed", `Expected completed, got ${String(runPayload.status)}: ${String(runPayload.error)}`);
     assert.ok(typeof runPayload.threadId === "string" && runPayload.threadId.length > 0, "Expected non-empty threadId");
+    assert.ok(typeof runPayload.turnId === "string" && runPayload.turnId.length > 0, "Expected non-empty turnId");
     assert.match(String(runPayload.finalResponse ?? ""), /CODEX_MCP_OK/);
-    console.log("Live Codex round-trip OK!");
+    console.log("Codex app-server round-trip OK!");
   } finally {
     await client.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

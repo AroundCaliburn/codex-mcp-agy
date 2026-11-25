@@ -115,12 +115,24 @@ cfg.mcpServers.codex = {
 fs.writeFileSync(mcpPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 ' "$MCP_CONFIG" "$NODE_BIN" "$ENTRYPOINT" "$CODEX_BIN_DIR"
 
-cp "$SCRIPT_DIR/agy/skills/codex-orchestrator/SKILL.md" "$SKILL_DEST_DIR/SKILL.md"
+render_agy_template() {
+  local src="$1"
+  local dest="$2"
+  "$NODE_BIN" -e '
+    const fs = require("node:fs");
+    const [src, dest, nodeBin, cliEntry] = process.argv.slice(1);
+    const content = fs.readFileSync(src, "utf8")
+      .replaceAll("node /home/fate/code/Harness/dist/src/cli.js", `${nodeBin} ${cliEntry}`);
+    fs.writeFileSync(dest, content, "utf8");
+  ' "$src" "$dest" "$NODE_BIN" "$SCRIPT_DIR/dist/src/cli.js"
+}
+
+render_agy_template "$SCRIPT_DIR/agy/skills/codex-orchestrator/SKILL.md" "$SKILL_DEST_DIR/SKILL.md"
 
 if [[ "$NO_RULE" -eq 0 ]]; then
   mkdir -p "$PLUGIN_DEST_DIR/rules"
   cp "$SCRIPT_DIR/agy/plugin/plugin.json" "$PLUGIN_DEST_DIR/plugin.json"
-  cp "$SCRIPT_DIR/agy/plugin/rules/AGENTS.md" "$PLUGIN_DEST_DIR/rules/AGENTS.md"
+  render_agy_template "$SCRIPT_DIR/agy/plugin/rules/AGENTS.md" "$PLUGIN_DEST_DIR/rules/AGENTS.md"
 fi
 
 if [[ -n "$PROJECT_RULE_DIR" ]]; then

@@ -2,7 +2,20 @@ import type { ApprovalMode, ModelReasoningEffort, SandboxMode, Usage } from "@op
 
 export type JobKind = "run" | "review" | "adversarial_review";
 
-export type JobStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
+export type JobStatus = "running" | "waiting_approval" | "waiting_input" | "completed" | "failed" | "cancelled" | "interrupted";
+
+export function isActiveJob(status: JobStatus): boolean {
+  return status === "running" || status === "waiting_approval" || status === "waiting_input";
+}
+
+export interface PendingRequest {
+  requestId: string | number;
+  method: string;
+  kind: "command_approval" | "file_approval" | "user_input";
+  summary: string;
+  details: unknown;
+  createdAt: string;
+}
 
 export interface GitSummary {
   isGitRepo: boolean;
@@ -36,6 +49,8 @@ export interface JobRecord {
   approvalPolicy: ApprovalMode;
   allowedPaths?: string[];
   threadId?: string;
+  turnId?: string;
+  pendingRequest?: PendingRequest;
   createdAt: string;
   startedAt: string;
   finishedAt?: string;
