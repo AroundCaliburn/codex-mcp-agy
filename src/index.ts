@@ -45,7 +45,6 @@ function errorContent(err: unknown) {
 
 export function createServer(): { server: McpServer; runner: CodexRunner } {
   const store = new JobStore();
-  store.load();
   const runner = new CodexRunner(store);
 
   const server = new McpServer({
@@ -227,6 +226,7 @@ export function createServer(): { server: McpServer; runner: CodexRunner } {
     },
     async (args) => {
       try {
+        if (store.getActiveJobs().length) await runner.reconcileActiveJobs().catch(() => {});
         if (args.jobId) {
           const job = store.getJob(args.jobId);
           if (!job) {
@@ -294,6 +294,7 @@ export function createServer(): { server: McpServer; runner: CodexRunner } {
     },
     async (args) => {
       try {
+        if (store.getActiveJobs().length) await runner.reconcileActiveJobs().catch(() => {});
         const job = args.jobId
           ? store.getJob(args.jobId)
           : store.getLatestFinishedJob(args.workingDirectory);
@@ -424,6 +425,11 @@ async function main() {
   process.stdin.once("end", shutdown);
 
   await server.connect(transport);
+  if (runner.getStore().getActiveJobs().length) {
+    void runner.reconcileActiveJobs().catch((error) => {
+      console.error("[codex-mcp-agy] Failed to reconnect to active jobs:", error);
+    });
+  }
 }
 
 main().catch((err) => {

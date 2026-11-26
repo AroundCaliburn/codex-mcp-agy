@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { stopRuntime } from "../src/runtime.js";
 
 function parseTextPayload(result: { content?: Array<{ type: string; text?: string }> }): Record<string, unknown> {
   const textBlock = result.content?.find((c) => c.type === "text");
@@ -16,23 +17,26 @@ async function main() {
   const stateFile = path.join(tmpDir, "jobs.json");
   const serverEntry = path.resolve(process.cwd(), "dist", "src", "index.js");
 
-  const transport = new StdioClientTransport({
+  const makeTransport = () => new StdioClientTransport({
     command: process.execPath,
     args: [serverEntry],
     env: {
       ...process.env,
       CODEX_MCP_STATE_FILE: stateFile,
+      CODEX_APP_SERVER_TRANSPORT: "ws",
       PATH: `/home/fate/.npm-global/bin:${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}`,
     },
   });
 
-  const client = new Client({
+  const makeClient = () => new Client({
     name: "codex-mcp-smoke-client",
     version: "0.2.0",
   });
 
+  const client = makeClient();
+  const reconnect = makeClient();
   try {
-    await client.connect(transport);
+    await client.connect(makeTransport());
 
     const toolsRes = await client.listTools();
     const names = toolsRes.tools.map((t) => t.name).sort();
@@ -53,6 +57,9 @@ async function main() {
     const health = parseTextPayload(healthRes as { content?: Array<{ type: string; text?: string }> });
     console.log("codex_health:", JSON.stringify(health));
     assert.equal(health.ok, true, "codex_health.ok must be true");
+    const runtime = health.runtime as { transport: string; pid: number; url: string; reused: boolean };
+    assert.equal(runtime.transport, "ws");
+    assert.equal(runtime.reused, false);
 
     const statusRes = await client.callTool({ name: "codex_status", arguments: {} });
     const statusPayload = parseTextPayload(statusRes as { content?: Array<{ type: string; text?: string }> });
@@ -85,9 +92,28 @@ async function main() {
     assert.ok(typeof runPayload.turnId === "string" && runPayload.turnId.length > 0, "Expected non-empty turnId");
     assert.match(String(runPayload.finalResponse ?? ""), /CODEX_MCP_OK/);
     console.log("Codex app-server round-trip OK!");
-  } finally {
+
     await client.close();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    const ready = await fetch(new URL("/readyz", runtime.url.replace(/^ws:/, "http:")), { signal: AbortSignal.timeout(1000) });
+    assert.equal(ready.status, 200, "Runtime must survive closing the first client");
+    await ready.body?.cancel();
+
+    await reconnect.connect(makeTransport());
+    const reconnectedHealth = parseTextPayload(
+      await reconnect.callTool({ name: "codex_health", arguments: {} }) as Parameters<typeof parseTextPayload>[0],
+    );
+    const reconnectedRuntime = reconnectedHealth.runtime as typeof runtime;
+    assert.equal(reconnectedHealth.ok, true);
+    assert.equal(reconnectedRuntime.pid, runtime.pid);
+    assert.equal(reconnectedRuntime.reused, true);
+    console.log("Detached Codex app-server reconnect OK!");
+  } finally {
+    try {
+      await Promise.all([client.close(), reconnect.close()]);
+    } finally {
+      await stopRuntime(tmpDir);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   }
 }
 

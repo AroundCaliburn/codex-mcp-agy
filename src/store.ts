@@ -33,37 +33,30 @@ export class JobStore {
     return this.filePath;
   }
 
-  load(): void {
+  load({ recoverStale = this.recover } = {}): void {
     if (this.loaded) return;
     this.loaded = true;
 
     try {
       this.jobs = this.read();
-      if (!this.recover) return;
-      let recovered = false;
-      const now = new Date().toISOString();
-
-      this.jobs = this.jobs.map((job) => {
-        if (isActiveJob(job.status)) {
-          recovered = true;
-          return {
-            ...job,
-            status: "interrupted" as const,
-            pendingRequest: undefined,
-            finishedAt: job.finishedAt ?? now,
-            error: job.error ?? "MCP server restarted while job was active",
-          };
-        }
-        return job;
-      });
-
-      if (recovered) {
-        this.save();
-      }
     } catch (err) {
       console.error(`[codex-mcp-agy] Failed to load job store (${this.filePath}):`, err);
-      this.jobs = [];
     }
+    if (recoverStale) this.markStaleJobsInterrupted("MCP server restarted while job was active");
+  }
+
+  markStaleJobsInterrupted(reason: string): void {
+    this.load({ recoverStale: false });
+    if (!this.jobs.some((job) => isActiveJob(job.status))) return;
+    const now = new Date().toISOString();
+    this.jobs = this.jobs.map((job) => isActiveJob(job.status) ? {
+      ...job,
+      status: "interrupted",
+      pendingRequest: undefined,
+      finishedAt: job.finishedAt ?? now,
+      error: job.error ?? reason,
+    } : job);
+    this.save();
   }
 
   private read(): JobRecord[] {

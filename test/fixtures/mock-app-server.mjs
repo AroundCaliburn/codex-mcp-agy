@@ -41,9 +41,12 @@ lines.on("line", (line) => {
       initialized = true;
       break;
     case "thread/start":
-    case "thread/resume":
       assert.equal(initialized, true);
       reply({ thread: { id: threadId } });
+      break;
+    case "thread/resume":
+      assert.equal(initialized, true);
+      reply({ thread: { id: threadId, turns: [] } });
       break;
     case "turn/start": {
       turnId = `fixture-turn-${++turnNumber}`;

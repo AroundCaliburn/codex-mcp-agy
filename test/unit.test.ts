@@ -11,6 +11,7 @@ import test, { type TestContext } from "node:test";
 import { findOutOfScopeFiles, normalizeRelativePath } from "../src/git.js";
 import { buildAdversarialReviewPrompt, buildReviewPrompt } from "../src/prompts.js";
 import { CodexRunner, resolveModelAlias } from "../src/runner.js";
+import { ensureRuntime, stopRuntime } from "../src/runtime.js";
 import { JobStore } from "../src/store.js";
 import type { JobRecord } from "../src/types.js";
 
@@ -289,4 +290,277 @@ test("CLI watch reloads updates without recovering the live job and exits 2 on t
   assert.equal(new JobStore(stateFile, false).getJob(jobId)?.status, "running");
   store.updateJob(jobId, (job) => ({ ...job, status: "waiting_input" }));
   assert.equal(JSON.parse((await result).stdout).status, "waiting_input");
+});
+
+test("app-server falls back to stdio without a built-in WebSocket", async (t) => {
+  const originalWebSocket = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+  const originalTransport = process.env.CODEX_APP_SERVER_TRANSPORT;
+  Object.defineProperty(globalThis, "WebSocket", { value: undefined, configurable: true });
+  delete process.env.CODEX_APP_SERVER_TRANSPORT;
+  t.after(() => {
+    if (originalWebSocket) Object.defineProperty(globalThis, "WebSocket", originalWebSocket);
+    else Reflect.deleteProperty(globalThis, "WebSocket");
+    if (originalTransport !== undefined) process.env.CODEX_APP_SERVER_TRANSPORT = originalTransport;
+    else delete process.env.CODEX_APP_SERVER_TRANSPORT;
+  });
+
+  assert.equal(new AppServerClient().transport, "stdio");
+  process.env.CODEX_APP_SERVER_TRANSPORT = "ws";
+  const explicit = new AppServerClient();
+  assert.equal(explicit.transport, "ws");
+  await assert.rejects(explicit.connect(), /WebSocket transport requires Node.js/);
+});
+
+test("detached runtime is reused and recovers completed and in-progress jobs", { timeout: 5000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-mcp-runtime-"));
+  const stateFile = path.join(dir, "jobs.json");
+  const binary = path.join(dir, "mock-codex");
+  fs.writeFileSync(binary, `#!${process.execPath}
+if (process.argv[process.argv.indexOf("--listen") + 1] !== "ws://127.0.0.1:0") process.exit(1);
+if (process.env.OPENAI_API_KEY !== "test-key") process.exit(2);
+console.log("  listening on: ws://127.0.0.1:43210");
+setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+  const logFile = path.join(dir, "runtime.log");
+  fs.writeFileSync(logFile, "  listening on: ws://127.0.0.1:43209\n");
+
+  let pid: number | undefined;
+  let first: CodexRunner | undefined;
+  let second: CodexRunner | undefined;
+  const originalNoSystemd = process.env.CODEX_RUNTIME_NO_SYSTEMD;
+  const originalKey = process.env.OPENAI_API_KEY;
+  process.env.CODEX_RUNTIME_NO_SYSTEMD = "0";
+  process.env.OPENAI_API_KEY = "test-key";
+  t.after(async () => {
+    try {
+      await first?.shutdown();
+      await second?.shutdown();
+      await stopRuntime(dir);
+      assert.equal(fs.existsSync(path.join(dir, "runtime.json")), false);
+      assert.equal(fs.existsSync(path.join(dir, "runtime.token")), false);
+      if (pid) {
+        const runtimePid = pid;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          try {
+            process.kill(runtimePid, 0);
+          } catch (error) {
+            assert.equal((error as NodeJS.ErrnoException).code, "ESRCH");
+            return;
+          }
+          await setTimeout(10);
+        }
+        assert.fail(`Detached runtime ${runtimePid} survived stopRuntime`);
+      }
+    } finally {
+      if (originalNoSystemd === undefined) delete process.env.CODEX_RUNTIME_NO_SYSTEMD;
+      else process.env.CODEX_RUNTIME_NO_SYSTEMD = originalNoSystemd;
+      if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = originalKey;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Mock the socket boundary while exercising actual detached spawn and process cleanup.
+  let readyFailures = 0;
+  const probe = t.mock.method(globalThis, "fetch", async (url: URL) => {
+    assert.equal(url.href, "http://127.0.0.1:43210/readyz");
+    return new Response(null, { status: readyFailures-- > 0 ? 503 : 200 });
+  });
+
+  if (process.platform === "linux") {
+    const tokenFile = path.join(dir, "runtime.token");
+    fs.writeFileSync(tokenFile, "a".repeat(64), { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, "runtime.json"), JSON.stringify({
+      url: "ws://127.0.0.1:43209", pid: process.pid, tokenFile,
+    }));
+  }
+  const runtime = await ensureRuntime(dir, binary);
+  pid = runtime.pid;
+  assert.equal(runtime.reused, false);
+  assert.deepEqual(probe.mock.calls.map(({ arguments: [url] }) => String(url)), ["http://127.0.0.1:43210/readyz"]);
+  assert.equal(process.kill(pid, 0), true);
+  if (process.platform === "linux") {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const sessionId = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[3]);
+    assert.equal(sessionId, pid, "Runtime must have its own session");
+  }
+  assert.match(runtime.token, /^[a-f0-9]{64}$/);
+  assert.equal(runtime.url, "ws://127.0.0.1:43210");
+  assert.equal(runtime.unitName, undefined);
+  assert.doesNotMatch(fs.readFileSync(logFile, "utf8"), /systemd runtime startup/);
+  assert.equal(fs.statSync(path.join(dir, "runtime.token")).mode & 0o777, 0o600);
+  readyFailures = 2;
+  probe.mock.resetCalls();
+  assert.deepEqual(await ensureRuntime(dir, binary), { ...runtime, reused: true });
+  assert.equal(probe.mock.callCount(), 3);
+
+  readyFailures = 3;
+  const stateBefore = fs.readFileSync(path.join(dir, "runtime.json"), "utf8");
+  await assert.rejects(ensureRuntime(dir, binary), /Live Codex runtime .* is not ready/);
+  assert.equal(process.kill(pid, 0), true);
+  assert.equal(fs.readFileSync(path.join(dir, "runtime.json"), "utf8"), stateBefore);
+  assert.equal(fs.readFileSync(path.join(dir, "runtime.token"), "utf8"), runtime.token);
+
+  const completed = {
+    id: "completed-turn",
+    status: "completed",
+    items: [
+      { type: "agentMessage", text: "Earlier message" },
+      { type: "commandExecution", command: "git status", exitCode: 0, status: "completed" },
+      { type: "agentMessage", text: "Recovered result" },
+    ],
+  };
+  const resumed: string[] = [];
+  let closedConnections = 0;
+  let currentSocket: MockWebSocket;
+  let finishLiveOnResume = false;
+  let checkTurnBaseline: (() => void) | undefined;
+  class MockWebSocket extends EventTarget {
+    static OPEN = 1;
+    readyState = 0;
+    initialized = false;
+
+    constructor(url: string, options: { headers: { Authorization: string } }) {
+      super();
+      currentSocket = this;
+      assert.equal(url, runtime.url);
+      assert.equal(options.headers.Authorization, `Bearer ${runtime.token}`);
+      queueMicrotask(() => {
+        this.readyState = MockWebSocket.OPEN;
+        this.dispatchEvent(new Event("open"));
+      });
+    }
+
+    close() {
+      this.readyState = 3;
+      closedConnections++;
+      this.dispatchEvent(new Event("close"));
+    }
+
+    send(data: string) {
+      const { id, method, params } = JSON.parse(data);
+      const reply = (result: unknown) => this.emit({ id, result });
+      if (method === "initialize") {
+        reply({});
+        return;
+      }
+      if (method === "initialized") {
+        this.initialized = true;
+        return;
+      }
+      assert.equal(this.initialized, true);
+      switch (method) {
+        case "thread/read":
+          assert.equal(params.includeTurns, true);
+          if (params.threadId === "completed") {
+            reply({ thread: { status: { type: "idle" }, turns: [completed] } });
+          } else if (params.threadId === "active") {
+            reply({ thread: { status: { type: "active" }, turns: [{ id: "live-turn", status: "inProgress" }] } });
+          } else {
+            this.emit({ id, error: { message: "Thread not found" } });
+          }
+          break;
+        case "thread/resume":
+          resumed.push(params.threadId);
+          reply({ thread: { id: params.threadId, turns: params.threadId === "completed" ? [completed] : [] } });
+          if (!finishLiveOnResume || params.threadId !== "active") break;
+          finishLiveOnResume = false;
+          this.emit({
+            method: "item/completed",
+            params: { threadId: "active", turnId: "live-turn", item: { type: "agentMessage", text: "Live result" } },
+          });
+          this.emit({
+            method: "turn/completed",
+            params: { threadId: "active", turn: { id: "live-turn", status: "completed" } },
+          });
+          break;
+        case "turn/start":
+          checkTurnBaseline?.();
+          this.close();
+          break;
+        default:
+          assert.fail(`Unexpected method ${method}`);
+      }
+    }
+
+    emit(message: unknown) {
+      this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(message) }));
+    }
+  }
+  const originalWebSocket = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+  Object.defineProperty(globalThis, "WebSocket", { value: MockWebSocket, configurable: true, writable: true });
+  t.after(() => {
+    if (originalWebSocket) Object.defineProperty(globalThis, "WebSocket", originalWebSocket);
+    else Reflect.deleteProperty(globalThis, "WebSocket");
+  });
+
+  const store = new JobStore(stateFile, false);
+  store.createJob(makeJob({
+    jobId: "done", status: "running", workingDirectory: dir, threadId: "completed", turnId: completed.id,
+  }));
+  store.createJob(makeJob({
+    jobId: "live", kind: "review", status: "waiting_input", workingDirectory: dir, threadId: "active",
+    previousTurnId: null,
+  }));
+  store.createJob(makeJob({
+    jobId: "stale", status: "running", workingDirectory: dir, threadId: "completed", previousTurnId: completed.id,
+  }));
+  store.createJob(makeJob({
+    jobId: "missing", status: "running", workingDirectory: dir, threadId: "missing",
+  }));
+  first = new CodexRunner(store, { binary, transport: "ws" });
+  await first.reconcileActiveJobs();
+  assert.equal(store.getJob("done")?.status, "completed");
+  assert.equal(store.getJob("done")?.finalResponse, "Recovered result");
+  assert.deepEqual(store.getJob("done")?.itemsSummary?.commands, [
+    { command: "git status", exitCode: 0, status: "completed" },
+  ]);
+  assert.ok(store.getJob("done")?.gitSummary);
+  assert.equal(store.getJob("missing")?.status, "interrupted");
+  assert.equal(store.getJob("stale")?.status, "interrupted");
+  assert.equal(store.getJob("stale")?.turnId, undefined);
+  assert.equal(store.getJob("stale")?.finalResponse, undefined);
+  assert.equal(store.getJob("live")?.turnId, "live-turn");
+  assert.equal(store.getJob("live")?.status, "running");
+  assert.deepEqual(resumed, ["active"]);
+
+  await first.shutdown();
+  assert.equal(closedConnections, 1);
+  assert.equal(process.kill(pid, 0), true);
+  assert.equal((await ensureRuntime(dir, binary)).pid, pid);
+  const secondStore = new JobStore(stateFile);
+  second = new CodexRunner(secondStore, { binary, transport: "ws" });
+  await second.reconcileActiveJobs();
+  assert.deepEqual(resumed, ["active", "active"]);
+  assert.equal(secondStore.getJob("live")?.status, "running");
+  await t.test("reconnects after a dropped socket without an MCP call", async () => {
+    finishLiveOnResume = true;
+    // The first automatic reconnect also encounters an unready runtime and has to retry.
+    readyFailures = 3;
+    currentSocket!.close();
+    for (let attempt = 0; attempt < 100 && secondStore.getJob("live")?.status !== "completed"; attempt++) {
+      await setTimeout(15);
+    }
+    assert.equal(secondStore.getJob("live")?.status, "completed");
+    assert.equal(secondStore.getJob("live")?.finalResponse, "Live result");
+    assert.deepEqual(resumed, ["active", "active", "active"]);
+  });
+
+  await t.test("persists the previous turn before starting and recovers no stale answer", async () => {
+    checkTurnBaseline = () => {
+      const [pending] = new JobStore(stateFile, false).getActiveJobs();
+      assert.equal(pending?.threadId, "completed");
+      assert.equal(pending?.turnId, undefined);
+      assert.equal(pending?.previousTurnId, completed.id);
+    };
+    const started = await second.startJob({
+      prompt: "Start after the historical turn", workingDirectory: dir, threadId: "completed",
+      background: true, skipGitRepoCheck: true,
+    });
+    for (let attempt = 0; attempt < 100 && secondStore.getJob(started.jobId)?.status === "running"; attempt++) {
+      await setTimeout(15);
+    }
+    assert.equal(secondStore.getJob(started.jobId)?.status, "interrupted");
+    assert.equal(secondStore.getJob(started.jobId)?.finalResponse, undefined);
+  });
 });

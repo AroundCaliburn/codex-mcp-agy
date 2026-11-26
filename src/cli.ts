@@ -79,7 +79,7 @@ async function run(args: string[]): Promise<void> {
   const flags = RunFlags.parse(values);
   // A standalone run owns its app-server and must leave the MCP job store available to the MCP process.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-mcp-cli-"));
-  const runner = new CodexRunner(new JobStore(path.join(dir, "jobs.json")));
+  const runner = new CodexRunner(new JobStore(path.join(dir, "jobs.json")), { transport: "stdio" });
   const shutdown = (signal: NodeJS.Signals) => {
     process.exitCode = signal === "SIGINT" ? 130 : 143;
     void runner.shutdown().catch((err) => console.error(err));

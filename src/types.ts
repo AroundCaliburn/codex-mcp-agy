@@ -50,6 +50,7 @@ export interface JobRecord {
   allowedPaths?: string[];
   threadId?: string;
   turnId?: string;
+  previousTurnId?: string | null;
   pendingRequest?: PendingRequest;
   createdAt: string;
   startedAt: string;

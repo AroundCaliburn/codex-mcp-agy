@@ -77,6 +77,7 @@ interface ActiveJob {
   jobId: string;
   threadId?: string;
   turnId?: string;
+  previousTurnId?: string | null;
   startingTurn: boolean;
   cancelling?: boolean;
   startup?: Promise<void>;
@@ -135,24 +136,145 @@ export class CodexRunner {
   private readonly active = new Map<string, ActiveJob>();
   private readonly client: AppServerClient;
   private closing = false;
+  private reconciliation?: Promise<void>;
+  private reconnectTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly store: JobStore,
-    { binary, requestTimeoutMs }: { binary?: string; requestTimeoutMs?: number } = {},
+    { binary, requestTimeoutMs, transport }: {
+      binary?: string;
+      requestTimeoutMs?: number;
+      transport?: AppServerClient["transport"];
+    } = {},
   ) {
+    store.load({ recoverStale: false });
     this.client = new AppServerClient({
       notification: (method, params) => this.onNotification(method, params as TurnEvent),
       request: (id, method, params) => this.onRequest(id, method, params),
       disconnect: (error) => {
-        for (const job of this.active.values()) {
-          this.finish(job, job.failure ? "failed" : "interrupted", job.failure ?? error.message);
+        if (this.client.transport === "ws") {
+          this.reconciliation = undefined;
+          for (const job of this.active.values()) job.waiter?.reject(error);
+          this.active.clear();
+          this.scheduleReconnect();
+        } else {
+          for (const job of this.active.values()) {
+            this.finish(job, job.failure ? "failed" : "interrupted", job.failure ?? error.message);
+          }
         }
       },
-    }, binary, requestTimeoutMs);
+    }, binary, requestTimeoutMs, { transport, stateDir: path.dirname(store.getStateFilePath()) });
   }
 
   getStore(): JobStore {
     return this.store;
+  }
+
+  reconcileActiveJobs(): Promise<void> {
+    if (this.closing) return Promise.reject(new Error("Codex runner is shutting down"));
+    if (this.reconciliation) return this.reconciliation;
+    const reconciliation = this.reconcile().catch((error) => {
+      if (this.reconciliation === reconciliation) this.reconciliation = undefined;
+      throw error;
+    });
+    this.reconciliation = reconciliation;
+    return reconciliation;
+  }
+
+  private scheduleReconnect(delayMs = 100): void {
+    if (this.closing || this.reconnectTimer || !this.store.getActiveJobs().length) return;
+    this.reconnectTimer = setTimeout(async () => {
+      let retry = false;
+      try {
+        await this.reconcileActiveJobs();
+        retry = !this.client.getRuntimeStatus().connected;
+      } catch {
+        retry = true;
+      } finally {
+        this.reconnectTimer = undefined;
+        if (retry) this.scheduleReconnect(Math.min(delayMs * 2, 5000));
+      }
+    }, delayMs);
+    this.reconnectTimer.unref();
+  }
+
+  private async reconcile(): Promise<void> {
+    const reason = "Codex runtime restarted while job was active";
+    if (this.client.transport === "stdio") {
+      this.store.markStaleJobsInterrupted(reason);
+      return;
+    }
+    await this.client.connect();
+    if (this.closing) return;
+    if (!this.client.getRuntimeStatus().reused) {
+      this.store.markStaleJobsInterrupted(reason);
+      return;
+    }
+    for (const job of this.store.getActiveJobs()) {
+      if (this.closing || !this.client.getRuntimeStatus().connected) {
+        throw new Error("Codex app-server disconnected during reconciliation");
+      }
+      await this.reconcileJob(job);
+    }
+  }
+
+  private async reconcileJob(job: JobRecord): Promise<void> {
+    const { jobId, threadId, previousTurnId } = job;
+    const active = this.trackJob(job);
+    const readTurn = async () => {
+      const { thread } = await this.client.request<{
+        thread: { status: { type: string }; turns: Turn[] };
+      }>("thread/read", { threadId, includeTurns: true });
+      const previousIndex = thread.turns.findIndex(({ id }) => id === previousTurnId);
+      const hasBaseline = previousTurnId === null || previousIndex >= 0;
+      const turn = active.turnId
+        ? thread.turns.find(({ id }) => id === active.turnId)
+        : hasBaseline ? thread.turns[previousIndex + 1] : undefined;
+      return { turn, canResume: (active.turnId !== undefined || hasBaseline) && thread.status.type === "active" };
+    };
+
+    try {
+      if (!threadId) throw new Error("Job has no recorded Codex thread");
+      const { turn, canResume } = await readTurn();
+      if (this.active.get(jobId) !== active) return;
+      if (turn) this.setTurnId(active, turn.id);
+      if (turn && turn.status !== "inProgress") {
+        this.completeTurn(active, turn, true);
+      } else if (canResume || turn?.status === "inProgress") {
+        active.startingTurn = true;
+        for (const item of turn?.items ?? []) {
+          if (!("status" in item) || item.status !== "inProgress") this.recordItem(active, item);
+        }
+        this.updatePending(active);
+        await this.client.request("thread/resume", { threadId });
+        // The turn can finish between the first read and the resume subscription.
+        if (this.active.get(jobId) === active) {
+          const { turn: latest, canResume: stillActive } = await readTurn();
+          if (this.active.get(jobId) !== active) return;
+          if (latest) {
+            this.setTurnId(active, latest.id);
+            this.completeTurn(active, latest, true);
+          } else if (!stillActive) {
+            this.finish(active, "interrupted", "Codex thread has no running turn");
+          }
+        }
+      } else {
+        this.finish(active, "interrupted", "Codex thread has no running turn");
+      }
+      await active.finishing;
+    } catch (error) {
+      if (this.closing || !this.client.getRuntimeStatus().connected) throw error;
+      this.finish(active, "interrupted", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private trackJob({ jobId, threadId, turnId, previousTurnId }: JobRecord): ActiveJob {
+    const active: ActiveJob = {
+      jobId, threadId, turnId, previousTurnId, startingTurn: false, pending: [],
+      items: { commands: [], fileChanges: [], mcpToolCalls: [], webSearches: [] },
+    };
+    this.active.set(jobId, active);
+    return active;
   }
 
   async startJob(options: RunOptions): Promise<JobRecord> {
@@ -162,6 +284,8 @@ export class CodexRunner {
       throw new Error(`Working directory does not exist or is not a directory: ${workingDirectory}`);
     }
 
+    await this.reconcileActiveJobs();
+    if (this.closing) throw new Error("Codex runner is shutting down");
     const threadId = options.threadId?.trim() ||
       (options.resumeLatest ? this.store.getLatestThreadId(workingDirectory) : undefined);
     if (threadId && this.activeThread(threadId)) {
@@ -187,11 +311,7 @@ export class CodexRunner {
         ? `Resuming thread ${threadId} in ${options.sandboxMode ?? "workspace-write"} mode`
         : `Starting new thread in ${options.sandboxMode ?? "workspace-write"} mode`],
     });
-    const active: ActiveJob = {
-      jobId, threadId, startingTurn: false, pending: [],
-      items: { commands: [], fileChanges: [], mcpToolCalls: [], webSearches: [] },
-    };
-    this.active.set(jobId, active);
+    const active = this.trackJob(initial);
     const result = options.background ? initial : this.waitForJob(active);
     active.startup = this.startTurn(active, initial, options);
     return result;
@@ -207,8 +327,8 @@ export class CodexRunner {
         if (stdout.trim() !== "true") {
           throw new Error("Working directory is outside a Git repository. Set skipGitRepoCheck to run here.");
         }
-        if (!this.active.has(job.jobId)) return;
       }
+      if (this.active.get(job.jobId) !== active) return;
 
       const threadParams = {
         model: job.model,
@@ -219,15 +339,24 @@ export class CodexRunner {
           ? { "sandbox_workspace_write.writable_roots": options.additionalDirectories.map((dir) => path.resolve(dir)) }
           : undefined,
       };
-      const { thread } = await this.client.request<{ thread: { id: string } }>(
+      const { thread } = await this.client.request<{ thread: { id: string; turns?: Turn[] } }>(
         job.threadId ? "thread/resume" : "thread/start",
-        job.threadId ? { ...threadParams, threadId: job.threadId } : threadParams,
+        job.threadId ? { ...threadParams, threadId: job.threadId, excludeTurns: false } : threadParams,
       );
-      if (!this.active.has(job.jobId)) return;
+      let turns = thread.turns;
+      if (job.threadId && !turns && this.active.get(job.jobId) === active) {
+        const result = await this.client.request<{ thread: { turns: Turn[] } }>(
+          "thread/read", { threadId: thread.id, includeTurns: true },
+        );
+        turns = result.thread.turns;
+      }
+      if (this.active.get(job.jobId) !== active) return;
       active.threadId = thread.id;
+      active.previousTurnId = turns?.at(-1)?.id ?? null;
       this.store.updateJob(job.jobId, (cur) => ({
         ...cur,
         threadId: thread.id,
+        previousTurnId: active.previousTurnId,
         progress: appendProgress(cur.progress, `thread.started: ${thread.id}`),
       }));
 
@@ -239,7 +368,7 @@ export class CodexRunner {
         approvalPolicy: job.approvalPolicy,
         effort: job.effort,
       });
-      if (!this.active.has(job.jobId)) return;
+      if (this.active.get(job.jobId) !== active) return;
       this.setTurnId(active, turn.id);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -265,7 +394,7 @@ export class CodexRunner {
   }
 
   private setTurnId(active: ActiveJob, turnId: string): void {
-    if (active.turnId) return;
+    if (active.turnId || turnId === active.previousTurnId) return;
     active.turnId = turnId;
     this.store.updateJob(active.jobId, (cur) => ({ ...cur, turnId }));
   }
@@ -307,7 +436,7 @@ export class CodexRunner {
     };
     const kind = REQUEST_KINDS.get(method);
     const active = this.activeThread(request?.threadId);
-    if (!kind || !active?.startingTurn || !request.turnId) {
+    if (!kind || !active?.startingTurn || !request.turnId || request.turnId === active.previousTurnId) {
       this.client.reject(id, `Unsupported request or inactive turn: ${method}`);
       return;
     }
@@ -327,7 +456,9 @@ export class CodexRunner {
     if (!event?.threadId) return;
     const active = this.activeThread(event.threadId);
     if (!active) return;
-    if (method === "turn/started" && active.startingTurn && event.turn) this.setTurnId(active, event.turn.id);
+    if (active.startingTurn && event.turn && (method === "turn/started" || method === "turn/completed")) {
+      this.setTurnId(active, event.turn.id);
+    }
     if (method === "serverRequest/resolved") {
       const pending = active.pending.filter((request) => request.requestId !== event.requestId);
       if (pending.length !== active.pending.length) {
@@ -339,9 +470,7 @@ export class CodexRunner {
     if (!active.turnId || active.turnId !== (event.turn?.id ?? event.turnId)) return;
 
     if (method === "item/completed" && event.item) {
-      if (event.item.type === "agentMessage") active.finalResponse = event.item.text;
-      if (event.item.type === "error") active.error = event.item.message;
-      const line = summarizeCompletedItem(event.item, active.items);
+      const line = this.recordItem(active, event.item);
       if (line) this.store.updateJob(active.jobId, (cur) => ({ ...cur, progress: appendProgress(cur.progress, line) }));
     } else if (method === "thread/tokenUsage/updated" && event.tokenUsage) {
       const counts = event.tokenUsage.total;
@@ -355,15 +484,33 @@ export class CodexRunner {
     } else if (method === "error" && !event.willRetry) {
       active.error = event.error?.message;
     } else if (method === "turn/completed" && event.turn && event.turn.status !== "inProgress") {
-      const status = event.turn.status === "interrupted" && active.cancelling ? "cancelled" : event.turn.status;
-      const error = event.turn.error?.message ?? (status === "failed" ? active.error ?? "Codex turn failed" : undefined);
-      active.finalResponse ??= event.turn.items?.filter((item) => item.type === "agentMessage").at(-1)?.text;
-      this.finish(active, status, error);
+      this.completeTurn(active, event.turn);
     }
   }
 
-  private finish(active: ActiveJob, status: JobStatus, error?: string): void {
-    if (!this.active.delete(active.jobId)) return;
+  private recordItem(active: ActiveJob, item: Item): string | undefined {
+    if (item.type === "agentMessage") active.finalResponse = item.text;
+    if (item.type === "error") active.error = item.message;
+    return summarizeCompletedItem(item, active.items);
+  }
+
+  private completeTurn(active: ActiveJob, turn: Turn, recovered = false): void {
+    if (turn.status === "inProgress") return;
+    if (recovered && turn.items?.length) {
+      active.items = { commands: [], fileChanges: [], mcpToolCalls: [], webSearches: [] };
+      for (const item of turn.items) this.recordItem(active, item);
+    } else {
+      active.finalResponse ??= turn.items?.filter((item) => item.type === "agentMessage").at(-1)?.text;
+    }
+    const status = turn.status === "interrupted" && active.cancelling ? "cancelled" : turn.status;
+    const error = turn.error?.message ??
+      (status === "failed" ? active.error ?? "Codex turn failed" : recovered ? active.error : undefined);
+    this.finish(active, status, error, recovered);
+  }
+
+  private finish(active: ActiveJob, status: JobStatus, error?: string, recovered = false): void {
+    if (this.active.get(active.jobId) !== active) return;
+    this.active.delete(active.jobId);
     const job = this.store.getJob(active.jobId)!;
     const finishedAt = new Date().toISOString();
     const durationMs = Date.parse(finishedAt) - Date.parse(job.startedAt);
@@ -372,6 +519,7 @@ export class CodexRunner {
         const updated = this.store.updateJob(active.jobId, (cur) => ({
           ...cur,
           status, error, finishedAt, durationMs, gitSummary,
+          turnId: active.turnId ?? cur.turnId,
           pendingRequest: undefined,
           itemsSummary: active.items,
           usage: active.usage ?? null,
@@ -385,7 +533,7 @@ export class CodexRunner {
         active.waiter = undefined;
       }
     };
-    if (status === "completed" && job.kind === "run") {
+    if (job.kind === "run" && (status === "completed" || recovered)) {
       active.finishing = inspectGitWorkspace(job.workingDirectory, job.allowedPaths).then(finalize, () => finalize());
     } else {
       finalize();
@@ -399,6 +547,7 @@ export class CodexRunner {
     answers?: Record<string, string[]>;
     wait?: boolean;
   }): Promise<JobRecord> {
+    await this.reconcileActiveJobs();
     const active = this.active.get(options.jobId);
     const pending = active?.pending[0];
     if (!active || !pending || active.cancelling || active.failure) {
@@ -426,6 +575,7 @@ export class CodexRunner {
   }
 
   async steerJob({ jobId, prompt }: { jobId: string; prompt: string }): Promise<JobRecord> {
+    await this.reconcileActiveJobs();
     const active = this.active.get(jobId);
     const job = this.store.getJob(jobId);
     if (!active?.threadId || !active.turnId || active.cancelling || job?.status !== "running") {
@@ -444,6 +594,7 @@ export class CodexRunner {
     job?: JobRecord;
     reason?: string;
   }> {
+    await this.reconcileActiveJobs();
     const job = jobId ? this.store.getJob(jobId) : this.store.getActiveJobs(workingDirectory)
       .find((candidate) => this.active.has(candidate.jobId));
     if (!job) return { cancelled: false, reason: jobId ? `Job not found: ${jobId}` : "No active job found" };
@@ -473,10 +624,13 @@ export class CodexRunner {
 
   async shutdown(): Promise<void> {
     this.closing = true;
+    clearTimeout(this.reconnectTimer);
     try {
-      for (const job of this.active.values()) this.finish(job, "interrupted", "Codex runner shut down while job was active");
+      if (this.client.transport === "stdio") {
+        for (const job of this.active.values()) this.finish(job, "interrupted", "Codex runner shut down while job was active");
+      }
     } finally {
-      await this.client.shutdown();
+      await this.client.close();
     }
   }
 
@@ -501,11 +655,20 @@ export class CodexRunner {
       process.env.OPENAI_API_KEY?.trim() || process.env.CODEX_API_KEY?.trim(),
     );
 
+    let runtimeError: string | undefined;
+    if (cliAvailable) {
+      try {
+        await this.reconcileActiveJobs();
+      } catch (error) {
+        runtimeError = error instanceof Error ? error.message : String(error);
+      }
+    }
     const jobs = this.store.listJobs();
     const runningCount = this.active.size;
 
     return {
-      ok: cliAvailable && (authJsonExists || hasApiKeyEnv),
+      ok: cliAvailable && !runtimeError && (authJsonExists || hasApiKeyEnv),
+      runtime: { ...this.client.getRuntimeStatus(), ...(runtimeError ? { error: runtimeError } : {}) },
       nodeVersion: process.version,
       codexCli: {
         binary: codexBin,
